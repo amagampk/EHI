@@ -1,0 +1,127 @@
+#Main code added vectorization and filter by gender for optimization
+import pandas as pd
+from fuzzywuzzy import fuzz
+import datetime
+import numpy as np
+#hana conn
+from hanaquery import queryTable, readCredentials
+#run password code first
+from hdbcli import dbapi
+conn= dbapi.connect(address="polarisdev.eds.phhs.org", port=30015,user=uid,password=pwd)
+
+df1 = pd.read_csv('/home/akhila/JH/Data/JH_POP_2010_2023.csv')# Source 1
+query='select "PatientEpicId", "FIRSTNAME", "LASTNAME", "BirthDate", "Age", "AgeGroup", "GENDER", "SSN", "RACE" FROM "_SYS_BIC"."PCCI.EmployeeHealth/D_PATIENTDIM"'
+df2 = pd.read_sql(query, conn)# Source 2
+
+df1['DOB_Pearl'] = df1['DOB_Pearl'].fillna('')
+df2['BirthDate'] = df2['BirthDate'].fillna('')
+
+# Function to assign age band based on date of birth
+def calculate_age(born):
+    today = datetime.date.today()
+    return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+# Define age bands
+age_bands = [(15, 25), (25, 35), (35, 45), (45, 55), (55, 65), (65, 75), (75, 85), (85, 95)]
+
+def assign_age_band(date_of_birth):
+  try:
+    dob = datetime.datetime.strptime(date_of_birth, '%Y-%m-%d').date()
+    age = calculate_age(dob)
+    for band in age_bands:
+        if age >= band[0] and age < band[1]:
+            return f"{band[0]}-{band[1]}"
+    return f">= {age_bands[-1][1]}"
+  except:
+    return "ERROR"
+
+# Add age band column to dataset
+df1['DOB_Pearl'] = df1['DOB_Pearl'].astype("str")
+df2['BirthDate'] = df2['BirthDate'].astype("str")
+df1['Age_Band'] = df1['DOB_Pearl'].apply(lambda x: assign_age_band(x))
+df2['Age_Band'] = df2['BirthDate'].apply(lambda x: assign_age_band(x))
+df1['Age_Band'] = df1['Age_Band'].astype("str")
+df2['Age_Band'] = df2['Age_Band'].astype("str")
+print(df1['Age_Band'].value_counts())
+print(df2['Age_Band'].value_counts())
+
+most_frequent1 = df1['Age_Band'].mode().iloc[0]
+most_frequent2 = df2['Age_Band'].mode().iloc[0]
+
+df1['Age_Band'] = df1['Age_Band'].replace('ERROR',most_frequent1)
+df2['Age_Band'] = df2['Age_Band'].replace('ERROR',most_frequent2)
+print(df1['Age_Band'].value_counts())
+print(df2['Age_Band'].value_counts())
+
+df1['PK'] = df1.apply(lambda x: '|'.join([str(x['FIRST_NAME_Pearl']), str(x['LAST_NAME_Pearl']), str(x['DOB_Pearl']), str(x['SEX_Pearl']), str(x['SSN_Pearl']) ,str(x['RACE'])]), axis=1)
+df2['PK'] = df2.apply(lambda x: '|'.join([str(x['FIRSTNAME']), str(x['LASTNAME']), str(x['BirthDate']), str(x['GENDER']), str(x['SSN']) ,str(x['RACE'])]), axis=1)
+
+df1['IDX_1'] = df1['LAST_NAME_Pearl'].str[:2]
+df2['IDX_1'] = df2['LASTNAME'].str[:2]
+print(df1.head())
+print(df2.head())
+
+#Vectorization before string match
+@np.vectorize
+def comp(a,b):
+  return fuzz.ratio(a.lower(),b.lower())
+def repl(a,d,e):
+  ala = {}
+  a1 = a.split("|")[0] #Firstname
+  a2 = a.split("|")[1] #Lastname
+  a3 = a.split("|")[2] #DOB 
+  a4 = a.split("|")[3] #Gender
+  a5 = a.split("|")[4] #SSN
+  a6 = a.split("|")[5] #Race
+  df3 = df2[df2['GENDER'] == a4]
+  df3 = df3[df3['Age_Band'] == e]
+  df3 = df3[df3['IDX_1'] == d]
+  for index,row in df3.iterrows():
+    b = row['PK']
+    b1 = b.split("|")[0] #Firstname
+    b2 = b.split("|")[1] #Lastname
+    b3 = b.split("|")[2] #DOB   
+    b5 = b.split("|")[4] #SSN      
+    c1 = comp(a1,b1) # compare first name with first name
+    c2 = comp(a2,b2)
+    c3 = comp(a3,b3)
+    c4 = comp(a5,b5)
+    c = c1*0.35 + c2*0.3 + c3*0.2 + c4*0.15
+    ala.update({b : c})
+  if len(ala) > 0:
+    key = max(ala, key=ala.get)
+    value = max(ala.values())
+    res = {"BEST_MATCH":key,"SCORE":value}
+  else :
+    res = {"BEST_MATCH":'',"SCORE":0}
+  return res
+df1['RESULT'] = list(map(repl,df1['PK'],df1['IDX_1'],df1['Age_Band']))
+print(df1.head())
+
+# define function to extract values from dictionary
+def get_values(dictionary):
+    best_match = dictionary['BEST_MATCH']
+    score = dictionary['SCORE']
+    return best_match, score
+
+# apply function to create two new columns
+df1[['MATCH', 'SCORE']] = df1['RESULT'].apply(lambda x: pd.Series(get_values(x)))
+
+# display resulting dataframe
+df1.drop(['RESULT'], axis=1)
+rslt_df = df1[df1['SCORE'] > 60]
+rslt_df.head()
+
+# Code to flag Minor Change in SSN
+rslt_df["SSN_target"] = rslt_df["MATCH"].str.split("|").str[4]
+
+# Function to count the number of different digits between two SSN's
+def check_digits_changed(id1, id2):
+    differences = sum(d1 != d2 for d1, d2 in zip(str(id1), str(id2)))
+    return differences <= 2 if differences > 0 else False
+
+# Flag rows where only one or two digits have changed in SSN
+rslt_df["SSN_FLAG"] = rslt_df.apply(lambda row: check_digits_changed(row["SSN_Pearl"], row["SSN_target"]), axis=1)
+rslt_df.head()
+df11=rslt_df[['PK','MATCH','SCORE']]
+rslt_df.to_csv('/home/akhila/JH/Data/MatchJHVector.csv')
